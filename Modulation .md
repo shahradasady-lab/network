@@ -8,7 +8,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import firwin, lfilter, freqz
-from scipy.integrate import cumtrapz
+from scipy.integrate import cumulative_trapezoid
 from scipy.special import erf
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
@@ -141,10 +141,12 @@ class IntelligentGFSKModem:
         # تولید پالس فرکانسی
         freq_pulse = self._frequency_pulse(binary_data, self.bt)
         
-        # محاسبه فاز
-        phase = 2 * np.pi * self.modulation_index * cumtrapz(
-            freq_pulse, dx=1/self.fs, initial=0
-        )
+        # محاسبه فاز با استفاده از cumulative_trapezoid
+        phase = np.zeros(len(freq_pulse))
+        phase[1:] = cumulative_trapezoid(freq_pulse, dx=1/self.fs)
+        
+        # اعمال شاخص مدولاسیون
+        phase = 2 * np.pi * self.modulation_index * phase
         
         # تولید سیگنال GFSK
         t = np.arange(len(phase)) / self.fs
@@ -172,11 +174,22 @@ class IntelligentGFSKModem:
         
         sequences = np.array(sequences)
         
-        # پیش‌بینی با شبکه عصبی (در حالت عملی، مدل باید آموزش دیده باشد)
-        # این بخش نیاز به داده‌های آموزشی دارد
-        # compensated_sequences = self.nn_compensator.predict(sequences)
+        # در حالت عملی، اینجا مدل آموزش دیده استفاده می‌شود
+        # برای نمونه، یک شبیه‌سازی ساده انجام می‌دهیم
+        if len(sequences) > 0 and self.nn_compensator is not None:
+            # ایجاد داده شبیه‌سازی شده برای نمایش
+            # در عمل باید مدل آموزش دیده باشد
+            compensated_signal = signal.copy()
+            
+            # اعمال فیلتر ساده برای نمایش
+            from scipy.signal import butter, filtfilt
+            b, a = butter(3, 0.1)
+            compensated_real = filtfilt(b, a, np.real(compensated_signal))
+            compensated_imag = filtfilt(b, a, np.imag(compensated_signal))
+            compensated_signal = compensated_real + 1j * compensated_imag
+            
+            return compensated_signal
         
-        # برای نمونه، سیگنال اصلی را بازمی‌گردانیم
         return signal
     
     def _optimize_parameters(self, binary_data):
@@ -188,43 +201,70 @@ class IntelligentGFSKModem:
             if not (0.3 <= bt <= 0.7) or not (0.4 <= mod_index <= 0.9):
                 return 1e6
             
-            # شبیه‌سازی عملکرد با پارامترهای جدید
+            # ذخیره پارامترهای فعلی
+            original_bt = self.bt
+            original_mod_index = self.modulation_index
+            
+            # تست با پارامترهای جدید
             self.bt = bt
             self.modulation_index = mod_index
             
-            # مدولاسیون با پارامترهای جدید
-            modulated = self.modulate(binary_data[:100], adaptive=False)
-            
-            # معیارهای بهینه‌سازی
-            # 1. پهنای باند موثر
-            psd = np.abs(np.fft.fft(modulated))**2
-            freq = np.fft.fftfreq(len(modulated), 1/self.fs)
-            
-            # پهنای باند 99%
-            total_power = np.sum(psd)
-            cumulative_power = np.cumsum(np.sort(psd)[::-1])
-            idx_99 = np.where(cumulative_power >= 0.99 * total_power)[0][0]
-            bandwidth_99 = freq[idx_99] - freq[0]
-            
-            # 2. حساسیت به نویز (تقریب)
-            noise_sensitivity = 1 / (mod_index * np.sqrt(bt))
-            
-            # تابع هزینه ترکیبی
-            cost = 0.7 * (bandwidth_99 / self.fs) + 0.3 * noise_sensitivity
-            
-            return cost
+            try:
+                # مدولاسیون با پارامترهای جدید
+                modulated = self.modulate(binary_data[:100], adaptive=False)
+                
+                # معیارهای بهینه‌سازی
+                # 1. پهنای باند موثر
+                psd = np.abs(np.fft.fft(modulated))**2
+                freq = np.fft.fftfreq(len(modulated), 1/self.fs)
+                
+                # پهنای باند 99%
+                total_power = np.sum(psd)
+                cumulative_power = np.cumsum(np.sort(psd)[::-1])
+                idx_99 = np.where(cumulative_power >= 0.99 * total_power)[0][0]
+                bandwidth_99 = freq[idx_99] - freq[0]
+                
+                # 2. حساسیت به نویز (تقریب)
+                noise_sensitivity = 1 / (mod_index * np.sqrt(bt))
+                
+                # 3. پیچیدگی محاسباتی
+                complexity = bt * 10 + mod_index * 5
+                
+                # تابع هزینه ترکیبی
+                cost = (0.5 * (bandwidth_99 / self.fs) + 
+                       0.3 * noise_sensitivity + 
+                       0.2 * complexity)
+                
+                # بازگرداندن پارامترهای اصلی
+                self.bt = original_bt
+                self.modulation_index = original_mod_index
+                
+                return cost
+                
+            except Exception as e:
+                # در صورت خطا، هزینه زیاد بازگردان
+                self.bt = original_bt
+                self.modulation_index = original_mod_index
+                return 1e6
         
         # محدوده پارامترها برای بهینه‌سازی
         bounds = [(0.3, 0.7), (0.4, 0.9)]
         
-        # اجرای الگوریتم تکاملی دیفرانسیل
-        result = differential_evolution(objective, bounds, maxiter=50, popsize=15)
-        
-        if result.success:
-            self.bt, self.modulation_index = result.x
-            self.optimal_params = result.x
+        try:
+            # اجرای الگوریتم تکاملی دیفرانسیل
+            result = differential_evolution(objective, bounds, maxiter=30, popsize=10, seed=42)
+            
+            if result.success:
+                self.bt, self.modulation_index = result.x
+                self.optimal_params = result.x
+                print(f"بهینه‌سازی موفق: BT={result.x[0]:.3f}, Mod Index={result.x[1]:.3f}, Cost={result.fun:.4f}")
+            else:
+                print("بهینه‌سازی همگرا نشد، استفاده از پارامترهای پیش‌فرض")
+                
+        except Exception as e:
+            print(f"خطا در بهینه‌سازی: {e}")
     
-    def demodulate(self, received_signal, method='coherent'):
+    def demodulate(self, received_signal, method='discriminator'):
         """
         دمودولاسیون GFSK با روش‌های مختلف
         
@@ -248,21 +288,22 @@ class IntelligentGFSKModem:
         phase = np.unwrap(np.angle(signal))
         freq_estimate = np.diff(phase) * self.fs / (2 * np.pi)
         
+        # اضافه کردن یک نمونه برای هماهنگی طول
+        freq_estimate = np.append(freq_estimate, freq_estimate[-1])
+        
         # میانگین‌گیری بر روی هر نماد
-        symbols = []
+        binary_data = []
         for i in range(0, len(freq_estimate), self.samples_per_symbol):
             symbol_samples = freq_estimate[i:i+self.samples_per_symbol]
             if len(symbol_samples) > 0:
-                symbol_value = np.mean(symbol_samples[-self.samples_per_symbol//2:])
-                symbols.append(symbol_value)
+                # استفاده از نمونه‌های میانی برای تصمیم‌گیری بهتر
+                start_idx = self.samples_per_symbol // 4
+                end_idx = 3 * self.samples_per_symbol // 4
+                if len(symbol_samples) > end_idx:
+                    symbol_value = np.mean(symbol_samples[start_idx:end_idx])
+                    binary_data.append(1 if symbol_value > 0 else 0)
         
-        symbols = np.array(symbols)
-        
-        # تصمیم‌گیری
-        threshold = 0
-        binary_data = (symbols > threshold).astype(int)
-        
-        return binary_data
+        return np.array(binary_data)
     
     def _coherent_demodulation(self, signal):
         """دمودولاسیون همدوس"""
@@ -278,12 +319,29 @@ class IntelligentGFSKModem:
         phase = np.unwrap(np.angle(filtered))
         
         # آشکارسازی تغییرات فاز
-        phase_diff = np.diff(phase[self.samples_per_symbol//2::self.samples_per_symbol])
+        binary_data = []
+        for i in range(self.samples_per_symbol, len(phase), self.samples_per_symbol):
+            phase_diff = phase[i] - phase[i - self.samples_per_symbol]
+            binary_data.append(1 if phase_diff > 0 else 0)
+        
+        return np.array(binary_data)
+    
+    def _noncoherent_demodulation(self, signal):
+        """دمودولاسیون غیرهمدوس"""
+        # ایجاد سیگنال تأخیری
+        delayed_signal = np.roll(signal, self.samples_per_symbol)
+        
+        # محاسبه ضرب و استخراج فاز
+        product = signal * np.conj(delayed_signal)
+        phase_diff = np.angle(product)
         
         # تصمیم‌گیری
-        binary_data = (phase_diff > 0).astype(int)
+        binary_data = []
+        for i in range(self.samples_per_symbol, len(phase_diff), self.samples_per_symbol):
+            avg_phase = np.mean(phase_diff[i:i+self.samples_per_symbol])
+            binary_data.append(1 if avg_phase > 0 else 0)
         
-        return binary_data
+        return np.array(binary_data)
     
     def add_channel_effects(self, signal, snr_db=20, doppler=0, multipath=False):
         """
@@ -330,14 +388,14 @@ class IntelligentGFSKModem:
     
     def analyze_performance(self, original_data, received_data):
         """تحلیل عملکرد سیستم"""
-        # محاسبه نرخ خطای بیت (BER)
-        if len(original_data) > len(received_data):
-            original_data = original_data[:len(received_data)]
-        else:
-            received_data = received_data[:len(original_data)]
+        # اطمینان از طول یکسان
+        min_len = min(len(original_data), len(received_data))
+        original_data = original_data[:min_len]
+        received_data = received_data[:min_len]
         
+        # محاسبه نرخ خطای بیت (BER)
         errors = np.sum(original_data != received_data)
-        ber = errors / len(original_data)
+        ber = errors / len(original_data) if len(original_data) > 0 else 1.0
         
         # محاسبه طیف توان
         modulated_signal = self.modulate(original_data, adaptive=False)
@@ -345,22 +403,53 @@ class IntelligentGFSKModem:
         freq = np.fft.fftfreq(len(modulated_signal), 1/self.fs)
         
         # پهنای باند موثر
-        sorted_psd = np.sort(psd)[::-1]
-        cumulative_power = np.cumsum(sorted_psd)
-        total_power = np.sum(psd)
+        positive_idx = freq >= 0
+        positive_freq = freq[positive_idx]
+        positive_psd = psd[positive_idx]
         
-        idx_90 = np.where(cumulative_power >= 0.90 * total_power)[0][0]
-        idx_99 = np.where(cumulative_power >= 0.99 * total_power)[0][0]
+        if len(positive_psd) > 0:
+            sorted_psd = np.sort(positive_psd)[::-1]
+            cumulative_power = np.cumsum(sorted_psd)
+            total_power = np.sum(positive_psd)
+            
+            if total_power > 0:
+                idx_90 = np.where(cumulative_power >= 0.90 * total_power)[0]
+                idx_99 = np.where(cumulative_power >= 0.99 * total_power)[0]
+                
+                bandwidth_90 = positive_freq[idx_90[0]] if len(idx_90) > 0 else 0
+                bandwidth_99 = positive_freq[idx_99[0]] if len(idx_99) > 0 else 0
+            else:
+                bandwidth_90 = bandwidth_99 = 0
+        else:
+            bandwidth_90 = bandwidth_99 = 0
         
-        bandwidth_90 = freq[idx_90] - freq[0]
-        bandwidth_99 = freq[idx_99] - freq[0]
+        # محاسبه PAPR
+        papr = self.calculate_papr(modulated_signal)
         
         return {
             'ber': ber,
             'bandwidth_90': bandwidth_90,
             'bandwidth_99': bandwidth_99,
-            'optimal_params': self.optimal_params
+            'papr_db': papr,
+            'optimal_params': self.optimal_params,
+            'errors': errors,
+            'total_bits': min_len
         }
+    
+    def calculate_papr(self, signal):
+        """محاسبه PAPR"""
+        if len(signal) == 0:
+            return 0
+        
+        peak_power = np.max(np.abs(signal)**2)
+        avg_power = np.mean(np.abs(signal)**2)
+        
+        if avg_power > 0:
+            papr_db = 10 * np.log10(peak_power / avg_power)
+        else:
+            papr_db = 0
+            
+        return papr_db
 
 # نمونه استفاده از سیستم GFSK
 def demonstrate_gfsk_system():
@@ -378,7 +467,8 @@ def demonstrate_gfsk_system():
                                  bt=bt, modulation_index=mod_index)
     
     # تولید داده‌های تصادفی
-    num_bits = 1000
+    np.random.seed(42)  # برای تکرارپذیری
+    num_bits = 500
     binary_data = np.random.randint(0, 2, num_bits)
     
     print("="*60)
@@ -399,6 +489,8 @@ def demonstrate_gfsk_system():
         print(f"پارامترهای بهینه شده:")
         print(f"  BT product بهینه: {modem.optimal_params[0]:.3f}")
         print(f"  شاخص مدولاسیون بهینه: {modem.optimal_params[1]:.3f}")
+    else:
+        print("استفاده از پارامترهای پیش‌فرض")
     
     # اضافه کردن اثرات کانال
     print("\nاضافه کردن اثرات کانال (SNR=15dB, دوپلر=5Hz)...")
@@ -407,16 +499,19 @@ def demonstrate_gfsk_system():
     )
     
     # دمودولاسیون
-    print("انجام دمودولاسیون...")
+    print("انجام دمودولاسیون با روش discriminator...")
     demodulated_data = modem.demodulate(channel_signal, method='discriminator')
     
     # تحلیل عملکرد
     print("\nتحلیل عملکرد سیستم:")
     performance = modem.analyze_performance(binary_data, demodulated_data)
     
+    print(f"  تعداد بیت‌ها: {performance['total_bits']}")
+    print(f"  تعداد خطاها: {performance['errors']}")
     print(f"  نرخ خطای بیت (BER): {performance['ber']:.6f}")
     print(f"  پهنای باند 90%: {performance['bandwidth_90']:.2f} Hz")
     print(f"  پهنای باند 99%: {performance['bandwidth_99']:.2f} Hz")
+    print(f"  PAPR: {performance['papr_db']:.2f} dB")
     
     # نمایش سیگنال‌ها
     plt.figure(figsize=(15, 10))
@@ -424,66 +519,127 @@ def demonstrate_gfsk_system():
     # داده‌های اصلی
     plt.subplot(3, 2, 1)
     plt.step(range(len(binary_data[:50])), binary_data[:50], where='post')
-    plt.title('داده‌های باینری اصلی')
+    plt.title('داده‌های باینری اصلی (50 بیت اول)')
     plt.xlabel('نمونه')
     plt.ylabel('مقدار')
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     
-    # سیگنال مدوله‌شده
+    # سیگنال مدوله‌شده (بخش حقیقی)
     plt.subplot(3, 2, 2)
     plt.plot(np.real(modulated_signal[:500]))
-    plt.title('بخش حقیقی سیگنال GFSK')
+    plt.title('بخش حقیقی سیگنال GFSK (500 نمونه اول)')
     plt.xlabel('نمونه')
     plt.ylabel('دامنه')
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     
     # طیف توان
     plt.subplot(3, 2, 3)
     psd = np.abs(np.fft.fft(modulated_signal))**2
     freq = np.fft.fftfreq(len(modulated_signal), 1/fs)
-    positive_freq = freq[:len(freq)//2]
-    positive_psd = psd[:len(psd)//2]
-    plt.plot(positive_freq, 10*np.log10(positive_psd))
+    positive_idx = freq >= 0
+    positive_freq = freq[positive_idx]
+    positive_psd = psd[positive_idx]
+    
+    plt.plot(positive_freq, 10*np.log10(positive_psd + 1e-10))
     plt.title('طیف توان سیگنال GFSK')
     plt.xlabel('فرکانس (Hz)')
-    plt.ylabel('توان (dB)')
-    plt.grid(True)
+    plt.ylabel('چگالی طیف توان (dB)')
+    plt.grid(True, alpha=0.3)
+    
+    # مشخص کردن پهنای باند
+    if performance['bandwidth_99'] > 0:
+        plt.axvline(x=performance['bandwidth_99'], color='r', linestyle='--', alpha=0.7, 
+                   label=f'99% BW: {performance["bandwidth_99"]:.1f} Hz')
+        plt.legend()
     
     # سیگنال تحت تاثیر کانال
     plt.subplot(3, 2, 4)
     plt.plot(np.real(channel_signal[:500]))
-    plt.title('سیگنال تحت تاثیر کانال')
+    plt.title('سیگنال تحت تاثیر کانال (500 نمونه اول)')
     plt.xlabel('نمونه')
     plt.ylabel('دامنه')
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     
     # نمودار صورتگر فاز
     plt.subplot(3, 2, 5)
     phase = np.unwrap(np.angle(modulated_signal[:500]))
     plt.plot(phase)
-    plt.title('فاز سیگنال GFSK')
+    plt.title('فاز سیگنال GFSK (500 نمونه اول)')
     plt.xlabel('نمونه')
     plt.ylabel('فاز (رادیان)')
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     
     # مقایسه داده‌های اصلی و دمودوله شده
     plt.subplot(3, 2, 6)
-    plt.step(range(50), binary_data[:50], 'b-', where='post', label='اصلی', alpha=0.7)
-    plt.step(range(50), demodulated_data[:50], 'r--', where='post', label='دمودوله', alpha=0.7)
-    plt.title('مقایسه داده‌های اصلی و دمودوله')
+    compare_len = min(50, len(binary_data), len(demodulated_data))
+    plt.step(range(compare_len), binary_data[:compare_len], 'b-', where='post', 
+             label='اصلی', alpha=0.7, linewidth=2)
+    plt.step(range(compare_len), demodulated_data[:compare_len], 'r--', where='post', 
+             label='دمودوله', alpha=0.7, linewidth=2)
+    plt.title(f'مقایسه داده‌های اصلی و دمودوله (BER: {performance["ber"]:.4f})')
     plt.xlabel('نمونه')
     plt.ylabel('مقدار')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.show()
+    
+    # نمایش اطلاعات تکمیلی
+    print("\n" + "="*60)
+    print("خلاصه عملکرد:")
+    print("="*60)
+    print(f"1. بهره‌وری طیفی: {data_rate/performance['bandwidth_99']:.2f} bps/Hz")
+    print(f"2. مقاومت در برابر نویز: BER={performance['ber']:.6f} در SNR=15dB")
+    print(f"3. پیچیدگی PAPR: {performance['papr_db']:.2f} dB")
+    print(f"4. تطبیق‌پذیری: {'فعال' if modem.optimal_params is not None else 'غیرفعال'}")
     
     return modem, performance
 
 # اجرای نمایش سیستم GFSK
 if __name__ == "__main__":
+    print("شروع شبیه‌سازی سیستم GFSK...")
     gfsk_modem, perf = demonstrate_gfsk_system()
+    
+    # تست عملکرد در شرایط مختلف
+    print("\n" + "="*60)
+    print("آزمایش عملکرد در شرایط مختلف SNR:")
+    print("="*60)
+    
+    snr_values = [5, 10, 15, 20, 25]
+    ber_results = []
+    
+    for snr in snr_values:
+        # تولید داده جدید
+        test_data = np.random.randint(0, 2, 200)
+        
+        # مدولاسیون
+        test_signal = gfsk_modem.modulate(test_data, adaptive=False)
+        
+        # اضافه کردن نویز
+        noisy_signal = gfsk_modem.add_channel_effects(test_signal, snr_db=snr, 
+                                                     doppler=0, multipath=False)
+        
+        # دمودولاسیون
+        demod_data = gfsk_modem.demodulate(noisy_signal, method='discriminator')
+        
+        # محاسبه BER
+        min_len = min(len(test_data), len(demod_data))
+        errors = np.sum(test_data[:min_len] != demod_data[:min_len])
+        ber = errors / min_len if min_len > 0 else 1.0
+        
+        ber_results.append(ber)
+        print(f"SNR={snr:2d} dB -> BER={ber:.6f}")
+    
+    # رسم نمودار BER بر حسب SNR
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(snr_values, ber_results, 'bo-', linewidth=2, markersize=8)
+    plt.grid(True, which="both", ls="-", alpha=0.3)
+    plt.xlabel('SNR (dB)')
+    plt.ylabel('Bit Error Rate (BER)')
+    plt.title('عملکرد سیستم GFSK در شرایط مختلف SNR')
+    plt.xticks(snr_values)
+    plt.show()
 ```
 
 ## سیستم ۲: مدولاسیون P-OFDM با بهینه‌سازی پیشرفته
